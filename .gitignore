@@ -1,0 +1,12 @@
+.DS_Store
+*.knit.md
+*_files/
+.Rhistory
+.RData
+.Rproj.user/
+
+# Cached/generated reference objects
+references/*.rds
+
+# Optional: keep downloaded public references out of git if submitting separately
+# references/*.gtf.gz

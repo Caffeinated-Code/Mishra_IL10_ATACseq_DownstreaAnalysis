@@ -1,0 +1,1035 @@
+---
+title: "IL-10 suppression of inflammatory chromatin in primary human monocytes"
+subtitle: "Downstream ATAC-seq analysis of Mishra et al. GSE261244"
+author: "Swathi Dhanasekaran"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 140
+)
+set.seed(20260509)
+options(stringsAsFactors = FALSE)
+```
+
+```{r libraries}
+needed <- c(
+  "limma", "GenomicRanges", "rtracklayer",
+  "BSgenome.Hsapiens.UCSC.hg38", "JASPAR2024", "TFBSTools", "motifmatchr",
+  "AnnotationDbi", "org.Hs.eg.db",
+  "ggplot2", "dplyr", "tidyr", "readr", "tibble", "purrr",
+  "pheatmap", "ggrepel", "patchwork", "R.utils"
+)
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Install missing packages before rendering: ", paste(missing, collapse = ", "))
+}
+
+library(limma)
+library(GenomicRanges)
+library(rtracklayer)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(JASPAR2024)
+library(TFBSTools)
+library(motifmatchr)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(pheatmap)
+library(ggrepel)
+library(patchwork)
+library(R.utils)
+```
+
+```{bash manifest}
+echo "Input manifest"
+wc -l mishra_il10_atac_takehome/GSE261244_Merged_ATAC_peaks.bed
+wc -l mishra_il10_atac_takehome/GSE261244_ATAC_normalized_counts.txt
+shasum -a 256 mishra_il10_atac_takehome/GSE261244_Merged_ATAC_peaks.bed
+shasum -a 256 mishra_il10_atac_takehome/GSE261244_ATAC_normalized_counts.txt
+```
+
+```{r paths}
+data_dir <- "mishra_il10_atac_takehome"
+counts_file <- file.path(data_dir, "GSE261244_ATAC_normalized_counts.txt")
+bed_file <- file.path(data_dir, "GSE261244_Merged_ATAC_peaks.bed")
+ref_dir <- "references"
+dir.create(ref_dir, showWarnings = FALSE)
+
+gencode_gtf_gz <- file.path(ref_dir, "gencode.v45.annotation.gtf.gz")
+gencode_gtf_url <- "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/gencode.v45.annotation.gtf.gz"
+hallmark_gmt <- file.path(ref_dir, "h.all.v2024.1.Hs.symbols.gmt")
+hallmark_url <- "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/h.all.v2024.1.Hs.symbols.gmt"
+
+if (!file.exists(gencode_gtf_gz)) {
+  download.file(gencode_gtf_url, gencode_gtf_gz, mode = "wb", quiet = TRUE)
+}
+if (!file.exists(hallmark_gmt)) {
+  download.file(hallmark_url, hallmark_gmt, mode = "wb", quiet = TRUE)
+}
+```
+
+# Overview {-}
+
+This analysis uses the paper-released, library-size-normalized, log-scale ATAC
+peak matrix from primary human CD14+ monocytes. I use limma-trend as the
+differential accessibility engine because it models continuous log-scale
+accessibility across all six conditions while retaining donor as a blocking
+factor. I do not use DESeq2 or edgeR raw-count GLMs because rounding normalized
+log values back to integers would create artificial count data.
+
+The biological question is not simply "which peaks are significant?" It is
+whether IL-10 closes the inflammatory chromatin response wholesale, or whether it
+preferentially suppresses an IRF/interferon-linked component while much of the
+NF-kB/AP-1 inflammatory architecture remains accessible. That is the nuance the
+paper argues for, and it is the nuance this reduced ATAC-seq bundle can test.
+
+# Peak set and sample matrix characterization
+
+```{r load-inputs}
+counts <- read.delim(counts_file, row.names = 1, check.names = FALSE)
+bed <- read.delim(
+  bed_file,
+  header = FALSE,
+  col.names = c("chrom", "start", "end")
+)
+
+# README: BED is 0-based, half-open. Therefore width is end - start, and the
+# count matrix row name should be chr:start-end without any +1 conversion.
+bed <- bed %>%
+  mutate(
+    peak_id = paste0(chrom, ":", start, "-", end),
+    width = end - start
+  )
+
+stopifnot(nrow(counts) == 73341)
+stopifnot(nrow(bed) == 73341)
+stopifnot(identical(rownames(counts), bed$peak_id))
+stopifnot(ncol(counts) == 24)
+stopifnot(all(bed$width > 0))
+
+sample_info <- tibble(sample = colnames(counts)) %>%
+  mutate(
+    condition = sub("_D[0-9]+$", "", sample),
+    donor = sub("^.*_(D[0-9]+)$", "\\1", sample),
+    condition = factor(
+      condition,
+      levels = c("Rest", "IL10", "LPS", "IL10.plus.LPS", "TNF", "IL10.plus.TNF")
+    ),
+    donor = factor(donor, levels = paste0("D", 1:4))
+  )
+
+stopifnot(n_distinct(sample_info$condition) == 6)
+stopifnot(n_distinct(sample_info$donor) == 4)
+stopifnot(all(table(sample_info$condition) == 4))
+stopifnot(all(table(sample_info$donor) == 6))
+
+matrix_summary <- tibble(
+  peaks = nrow(counts),
+  samples = ncol(counts),
+  min_value = min(as.matrix(counts)),
+  median_value = median(as.matrix(counts)),
+  mean_value = mean(as.matrix(counts)),
+  max_value = max(as.matrix(counts)),
+  missing_values = sum(is.na(counts))
+)
+matrix_summary
+```
+
+```{r peak-characterization}
+chrom_summary <- bed %>%
+  count(chrom, name = "n_peaks") %>%
+  mutate(chrom = factor(chrom, levels = c(paste0("chr", 1:22), "chrX", "chrY"))) %>%
+  arrange(chrom)
+
+width_summary <- bed %>%
+  summarise(
+    min_width = min(width),
+    median_width = median(width),
+    mean_width = mean(width),
+    max_width = max(width)
+  )
+width_summary
+
+ggplot(chrom_summary, aes(chrom, n_peaks)) +
+  geom_col(fill = "#356d8c") +
+  labs(x = NULL, y = "Merged peaks", title = "Peak distribution across hg38 chromosomes") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(bed, aes(width)) +
+  geom_histogram(bins = 60, fill = "#6f8f3f", color = "white") +
+  labs(x = "Peak width (bp; BED end - start)", y = "Peaks", title = "Merged peak widths") +
+  theme_bw()
+```
+
+```{r accessibility-distribution}
+long_counts <- counts %>%
+  rownames_to_column("peak_id") %>%
+  pivot_longer(-peak_id, names_to = "sample", values_to = "accessibility") %>%
+  left_join(sample_info, by = "sample")
+
+ggplot(long_counts, aes(accessibility, color = condition)) +
+  geom_density(linewidth = 0.7) +
+  labs(
+    x = "Log-scale normalized accessibility",
+    y = "Density",
+    title = "Sample accessibility distributions are broadly comparable"
+  ) +
+  theme_bw()
+```
+
+The input checks support using this bundle as a coherent downstream ATAC-seq
+object: `r nrow(counts)` peaks, `r ncol(counts)` samples, no missing values, and
+an exact ordered 1:1 match between the BED intervals and matrix rows. The BED
+coordinates are used as standard 0-based, half-open intervals for ID matching;
+only when constructing `GRanges` for Bioconductor annotation do I convert starts
+to 1-based coordinates.
+
+The merged peak set has a median width of `r median(bed$width)` bp and spans
+autosomes plus chrX/chrY, with no chrM peaks in the consensus set. That peak-size
+range is compatible with a merged ATAC regulatory-element set rather than broad
+histone domains. The accessibility distributions are smooth and broadly aligned
+across conditions, which argues against gross sample-level failure or global
+chromatin collapse. These checks cannot prove the original libraries passed
+fragment-level ENCODE metrics, but they do confirm that the released matrix is
+internally consistent and biologically suitable for donor-paired downstream
+analysis.
+
+## MCQ 1: peak and matrix characterization
+
+The released matrix contains 73,341 merged hg38 ATAC peaks across 24 samples,
+with smooth log-scale accessibility distributions and an exact ordered match to
+the 3-column BED file. Which interpretation best captures what this first
+characterization establishes biologically?
+
+A. The dataset is ready for downstream chromatin-state comparison because the
+peak universe and sample matrix are internally coherent, the distributions do
+not suggest global sample failure, and the peak widths are consistent with
+regulatory ATAC elements.
+
+B. The dataset proves that every upstream ENCODE ATAC-seq QC metric passed,
+because chrM peaks are absent and the normalized matrix has no missing values.
+
+C. The most important biological feature of the matrix is the exact number of
+peaks; once the dimensions match the README, downstream interpretation is
+independent of coordinate convention and sample distribution.
+
+D. The broad range of log accessibility values means the matrix should be
+back-transformed and rounded so that raw-count models can be used for all
+subsequent contrasts.
+
+**Answer: A.** The section establishes that the released object is internally
+valid and interpretable as a regulatory ATAC peak matrix. It does not recreate
+fragment-level QC, and it does not justify raw-count models on normalized
+log-scale values.
+
+# Sample QC and replicate structure
+
+```{r qc-plots}
+sample_cor <- cor(as.matrix(counts), method = "pearson")
+pheatmap(
+  sample_cor,
+  annotation_col = as.data.frame(sample_info[, c("sample", "condition", "donor")]) %>%
+    tibble::column_to_rownames("sample"),
+  annotation_row = as.data.frame(sample_info[, c("sample", "condition", "donor")]) %>%
+    tibble::column_to_rownames("sample"),
+  main = "Sample-sample Pearson correlations",
+  fontsize = 8
+)
+
+pca <- prcomp(t(as.matrix(counts)), center = TRUE, scale. = FALSE)
+pca_df <- as_tibble(pca$x[, 1:4], rownames = "sample") %>%
+  left_join(sample_info, by = "sample")
+var_explained <- (pca$sdev^2 / sum(pca$sdev^2))[1:4]
+qc_summary <- tibble(
+  min_pairwise_correlation = min(sample_cor[upper.tri(sample_cor)]),
+  median_pairwise_correlation = median(sample_cor[upper.tri(sample_cor)]),
+  pc1_variance = var_explained[1],
+  pc2_variance = var_explained[2],
+  pc3_variance = var_explained[3],
+  pc4_variance = var_explained[4]
+)
+qc_summary
+
+ggplot(pca_df, aes(PC1, PC2, color = condition, shape = donor, label = sample)) +
+  geom_point(size = 3) +
+  geom_text_repel(size = 2.6, max.overlaps = 24) +
+  labs(
+    x = paste0("PC1 (", scales::percent(var_explained[1], accuracy = 0.1), ")"),
+    y = paste0("PC2 (", scales::percent(var_explained[2], accuracy = 0.1), ")"),
+    title = "PCA of normalized ATAC accessibility"
+  ) +
+  theme_bw()
+
+ggplot(pca_df, aes(PC3, PC4, color = condition, shape = donor, label = sample)) +
+  geom_point(size = 3) +
+  geom_text_repel(size = 2.6, max.overlaps = 24) +
+  labs(
+    x = paste0("PC3 (", scales::percent(var_explained[3], accuracy = 0.1), ")"),
+    y = paste0("PC4 (", scales::percent(var_explained[4], accuracy = 0.1), ")"),
+    title = "Later PCs check donor and treatment structure"
+  ) +
+  theme_bw()
+```
+
+```{r donor-pair-qc}
+condition_means <- long_counts %>%
+  group_by(condition, donor) %>%
+  summarise(median_accessibility = median(accessibility), .groups = "drop")
+
+ggplot(condition_means, aes(condition, median_accessibility, group = donor, color = donor)) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2) +
+  labs(
+    x = NULL,
+    y = "Median log accessibility",
+    title = "Global accessibility summaries retain the paired donor design"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+The QC plots ask whether the biological comparison is credible before any
+formal contrast is fit. The samples show high pairwise correlation
+(minimum `r round(qc_summary$min_pairwise_correlation, 3)`, median
+`r round(qc_summary$median_pairwise_correlation, 3)`) with no obvious isolated
+sample. PCA separates samples by treatment structure rather than producing an
+IL-10-only failure cluster. That is important biologically: IL-10 is not acting
+like a nonspecific toxicity or global chromatin-closing condition in this matrix.
+
+The donor-wise median accessibility plot shows that the same four donors remain
+trackable across all six conditions. This supports the paired design and
+protects the analysis from mistaking donor baseline differences for stimulus or
+IL-10 effects. The upstream ENCODE-style fragment metrics are not present in the
+bundle, so the appropriate downstream conclusion is narrower but still useful:
+the released normalized matrix behaves like a coherent, paired ATAC-seq dataset
+for contrast analysis, with no sample that should be excluded at this stage.
+
+## MCQ 2: sample QC and ENCODE context
+
+After distribution, correlation, PCA and donor-pair checks, which conclusion
+best describes the sample-level structure of this ATAC-seq matrix?
+
+A. IL-10-containing samples behave as global accessibility outliers, supporting
+the idea that IL-10 broadly shuts down chromatin rather than selectively
+modulating stimulus-responsive regions.
+
+B. The samples are sufficiently coherent for paired downstream analysis:
+replicates correlate well, no sample is an obvious outlier, and donor identity
+remains visible across conditions without overwhelming the treatment structure.
+
+C. Donor pairing can be ignored because PCA already shows treatment separation,
+so the donor term would only remove biological signal.
+
+D. The matrix-level QC proves that TSS enrichment, FRiP and insert-size
+periodicity met ENCODE thresholds, so no further caveat is needed.
+
+**Answer: B.** The sample structure supports the intended paired contrast
+design. The result also argues against a global IL-10 accessibility artifact,
+which is important for interpreting later suppression signatures as selective
+regulatory modulation rather than sample failure.
+
+# Contrast design and differential accessibility
+
+```{r limma-design}
+design <- model.matrix(~ 0 + condition + donor, sample_info)
+colnames(design) <- sub("^condition", "", colnames(design))
+
+contrast_matrix <- makeContrasts(
+  LPS_vs_Rest = LPS - Rest,
+  TNF_vs_Rest = TNF - Rest,
+  IL10_vs_Rest = IL10 - Rest,
+  IL10LPS_vs_LPS = IL10.plus.LPS - LPS,
+  IL10TNF_vs_TNF = IL10.plus.TNF - TNF,
+  levels = design
+)
+
+contrast_plan <- tibble(
+  contrast = c(
+    "LPS_vs_Rest",
+    "TNF_vs_Rest",
+    "IL10_vs_Rest",
+    "IL10LPS_vs_LPS",
+    "IL10TNF_vs_TNF"
+  ),
+  biological_question = c(
+    "Which regulatory elements open or close during TLR4-driven inflammatory stimulation?",
+    "Which regulatory elements respond to TNF receptor signaling in the same donor-matched cells?",
+    "What chromatin changes are induced by IL-10 alone before inflammatory challenge?",
+    "Which LPS-responsive elements are suppressed when IL-10 is present?",
+    "Does the IL-10 suppression direction generalize in the TNF context?"
+  )
+)
+contrast_plan
+
+fit <- lmFit(as.matrix(counts), design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2, trend = TRUE)
+
+contrast_results <- map(
+  colnames(contrast_matrix),
+  \(coef_name) {
+    topTable(fit2, coef = coef_name, number = Inf, sort.by = "none") %>%
+      rownames_to_column("peak_id") %>%
+      mutate(contrast = coef_name)
+  }
+) %>%
+  bind_rows()
+
+da_summary <- contrast_results %>%
+  mutate(direction = case_when(
+    adj.P.Val < 0.05 & logFC > 0.25 ~ "higher",
+    adj.P.Val < 0.05 & logFC < -0.25 ~ "lower",
+    TRUE ~ "not_FDR_effect"
+  )) %>%
+  count(contrast, direction) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+da_summary
+```
+
+```{r volcanoes}
+volcano_df <- contrast_results %>%
+  mutate(
+    label = case_when(
+      adj.P.Val < 0.05 & abs(logFC) > 1 ~ "FDR < 0.05, |logFC| > 1",
+      adj.P.Val < 0.05 & abs(logFC) > 0.25 ~ "FDR < 0.05, |logFC| > 0.25",
+      TRUE ~ "Other"
+    ),
+    neg_log10_fdr = -log10(pmax(adj.P.Val, .Machine$double.xmin))
+  )
+
+ggplot(volcano_df, aes(logFC, neg_log10_fdr, color = label)) +
+  geom_point(alpha = 0.25, size = 0.6) +
+  facet_wrap(~ contrast, scales = "free_y") +
+  scale_color_manual(values = c(
+    "FDR < 0.05, |logFC| > 1" = "#9f2d20",
+    "FDR < 0.05, |logFC| > 0.25" = "#d18f2f",
+    "Other" = "grey75"
+  )) +
+  labs(x = "limma log fold-change", y = "-log10 FDR", color = NULL, title = "Donor-adjusted accessibility contrasts") +
+  theme_bw()
+```
+
+The five contrasts separate three biological questions. `LPS vs Rest` and
+`TNF vs Rest` define the stimulus-responsive chromatin programs. `IL10 vs Rest`
+tests whether IL-10 alone preconditions the resting monocyte accessibility
+landscape. The two suppression contrasts ask whether adding IL-10 reduces
+accessibility after LPS or TNF challenge.
+
+I call directionally interpretable peaks at FDR < 0.05 and absolute logFC >
+0.25. The FDR threshold controls the large number of peak-wise tests, while the
+effect-size threshold avoids treating extremely small but statistically stable
+changes as biologically central. At that threshold, both LPS and TNF produce
+large accessibility programs, which is expected for primary monocytes exposed to
+strong innate immune stimuli. IL-10 reduces more peaks than it increases in the
+stimulated settings (`r da_summary$lower[da_summary$contrast == "IL10LPS_vs_LPS"]`
+lower versus `r da_summary$higher[da_summary$contrast == "IL10LPS_vs_LPS"]`
+higher for LPS; `r da_summary$lower[da_summary$contrast == "IL10TNF_vs_TNF"]`
+lower versus `r da_summary$higher[da_summary$contrast == "IL10TNF_vs_TNF"]`
+higher for TNF), consistent with a suppressive chromatin effect.
+
+The paired donor term is essential because each donor contributes all six
+conditions. This is normally what I would want in a small primary-cell ATAC-seq
+study: biological donor variability is real, but the paired design lets the
+model ask whether the same donor shifts accessibility after stimulation or
+IL-10. The next step is therefore not to compare all significant peaks
+indiscriminately, but to ask which stimulus-induced elements are reversed by
+IL-10 and whether the LPS and TNF arms show coherent directionality.
+
+## MCQ 3: contrast design
+
+The donor-adjusted contrasts show strong LPS and TNF chromatin responses and
+more IL-10-associated decreases than increases in the stimulated settings. Which
+interpretation best uses this contrast structure?
+
+A. The key IL-10 biology should be inferred from `IL10 vs Rest`, because
+anti-inflammatory memory must be visible before stimulation if it is real.
+
+B. The correct suppression question is stimulus-conditioned: define LPS- and
+TNF-responsive accessibility changes first, then ask whether IL-10 reverses
+those changes within the same donor-blocked design.
+
+C. Since both LPS and TNF generate many significant peaks, the exact identities
+of suppressed peaks are not biologically meaningful and downstream motif
+analysis should use all significant peaks together.
+
+D. The donor term should be excluded because primary donor variability is a
+clinical nuisance rather than part of the biological design.
+
+**Answer: B.** The contrast design keeps the biology conditional: IL-10
+suppression is interpreted against the stimulus program it modifies, not as an
+unpaired or stimulus-agnostic shift in accessibility.
+
+# IL-10 suppression signature
+
+```{r suppression-signature}
+lps_res <- contrast_results %>% filter(contrast == "LPS_vs_Rest")
+tnf_res <- contrast_results %>% filter(contrast == "TNF_vs_Rest")
+lps_sup_res <- contrast_results %>% filter(contrast == "IL10LPS_vs_LPS")
+tnf_sup_res <- contrast_results %>% filter(contrast == "IL10TNF_vs_TNF")
+
+signature_tbl <- bed %>%
+  select(peak_id, chrom, start, end, width) %>%
+  left_join(lps_res %>% select(peak_id, lps_logFC = logFC, lps_fdr = adj.P.Val), by = "peak_id") %>%
+  left_join(tnf_res %>% select(peak_id, tnf_logFC = logFC, tnf_fdr = adj.P.Val), by = "peak_id") %>%
+  left_join(lps_sup_res %>% select(peak_id, il10_lps_logFC = logFC, il10_lps_fdr = adj.P.Val), by = "peak_id") %>%
+  left_join(tnf_sup_res %>% select(peak_id, il10_tnf_logFC = logFC, il10_tnf_fdr = adj.P.Val), by = "peak_id") %>%
+  mutate(
+    lps_induced = lps_fdr < 0.05 & lps_logFC > 1,
+    tnf_induced = tnf_fdr < 0.05 & tnf_logFC > 1,
+    il10_lps_suppressed = lps_induced & il10_lps_fdr < 0.05 & il10_lps_logFC < -0.75,
+    il10_lps_broad_suppressed = lps_fdr < 0.05 & lps_logFC > 0.25 & il10_lps_fdr < 0.05 & il10_lps_logFC < -0.25,
+    il10_tnf_same_direction = il10_tnf_logFC < 0
+  )
+
+suppression_summary <- signature_tbl %>%
+  summarise(
+    lps_induced = sum(lps_induced),
+    tnf_induced = sum(tnf_induced),
+    strong_lps_il10_suppressed = sum(il10_lps_suppressed),
+    broad_lps_il10_suppressed = sum(il10_lps_broad_suppressed),
+    fraction_strong_signature_same_direction_in_tnf =
+      mean(il10_tnf_same_direction[il10_lps_suppressed])
+  )
+suppression_summary
+
+foreground_peaks <- signature_tbl %>% filter(il10_lps_suppressed)
+broad_foreground_peaks <- signature_tbl %>% filter(il10_lps_broad_suppressed)
+```
+
+```{r suppression-plots}
+ggplot(signature_tbl, aes(lps_logFC, il10_lps_logFC)) +
+  geom_point(alpha = 0.16, size = 0.5, color = "grey45") +
+  geom_point(
+    data = signature_tbl %>% filter(il10_lps_suppressed),
+    aes(lps_logFC, il10_lps_logFC),
+    alpha = 0.45, size = 0.7, color = "#9f2d20"
+  ) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(
+    x = "LPS vs Rest logFC",
+    y = "IL10 + LPS vs LPS logFC",
+    title = "IL-10 suppression is concentrated among LPS-induced peaks"
+  ) +
+  theme_bw()
+
+ggplot(signature_tbl %>% filter(il10_lps_suppressed), aes(il10_lps_logFC, il10_tnf_logFC)) +
+  geom_point(alpha = 0.3, size = 0.7, color = "#356d8c") +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(
+    x = "IL10 + LPS vs LPS logFC",
+    y = "IL10 + TNF vs TNF logFC",
+    title = "TNF contrast is used as a sign-consistency check"
+  ) +
+  theme_bw()
+```
+
+```{r signature-heatmap}
+top_signature <- foreground_peaks %>%
+  arrange(il10_lps_fdr, il10_lps_logFC) %>%
+  slice_head(n = 800) %>%
+  pull(peak_id)
+
+heat_mat <- as.matrix(counts[top_signature, ])
+heat_mat_z <- t(scale(t(heat_mat)))
+heat_mat_z[is.na(heat_mat_z)] <- 0
+ann_col <- sample_info %>%
+  select(sample, condition, donor) %>%
+  as.data.frame()
+rownames(ann_col) <- ann_col$sample
+ann_col$sample <- NULL
+
+pheatmap(
+  heat_mat_z,
+  show_rownames = FALSE,
+  cluster_cols = FALSE,
+  annotation_col = ann_col,
+  main = "Top IL-10-suppressed LPS-induced ATAC peaks"
+)
+```
+
+The signature definition is deliberately stricter than "any negative IL-10
+effect": the peak must first be LPS-induced, then decreased by IL-10 in the LPS
+context. This avoids calling constitutively variable or IL-10-only peaks part of
+the anti-inflammatory program.
+
+Using a strong LPS-induced threshold, `r suppression_summary$lps_induced` peaks
+open with LPS and `r suppression_summary$strong_lps_il10_suppressed` of those
+are suppressed by IL-10. A broader but still donor-adjusted definition identifies
+`r suppression_summary$broad_lps_il10_suppressed` LPS-induced peaks with IL-10
+reversal. The heatmap shows that this is not driven by one donor; the signature
+has a coherent condition-level pattern across the paired samples.
+
+I do not require the same peak to be FDR-significant in both LPS and TNF
+suppression contrasts. The README warns that this collapses the signature for
+reasons of power and stimulus biology. A better scientific question is whether
+the LPS-defined IL-10-suppressed peaks tend to move in the same direction in the
+TNF setting. That is closer to the paper's conclusion: IL-10 repeatedly targets
+IRF/interferon-linked responses, but the strength and detectability of the
+signal differ by stimulus and assay.
+
+## MCQ 4: IL-10 suppression signature
+
+The LPS-defined IL-10 suppression signature contains thousands of LPS-induced
+peaks that close with IL-10, and most of the strong signature moves in the same
+direction in the TNF suppression contrast even though the signature is not
+defined by requiring co-significance. Which conclusion best captures the
+regulatory interpretation?
+
+A. IL-10 targets a directionally consistent suppression program across stimuli,
+but the analysis should derive a stable foreground from the stronger LPS arm and
+use TNF as a sign-consistency test rather than a strict co-FDR filter.
+
+B. The TNF arm should be ignored because TNF receptor signaling and TLR4
+signaling cannot share downstream chromatin regulation.
+
+C. Only peaks significant in both LPS and TNF suppression contrasts should be
+used downstream; requiring co-significance is the only durable definition of
+stimulus-independent IL-10 biology.
+
+D. The largest IL-10 effect is best interpreted as a global reduction in
+accessibility, because the signature heatmap shows lower signal in IL-10-treated
+samples.
+
+**Answer: A.** The result supports a real IL-10 suppression axis with asymmetric
+detectability across stimuli. This framing preserves enough LPS-defined peaks
+for motif and pathway analysis while still testing whether the TNF arm agrees in
+direction.
+
+# Peak-to-gene annotation
+
+```{r import-gencode}
+gtf_genes_rds <- file.path(ref_dir, "gencode.v45.annotation.genes.rds")
+if (file.exists(gtf_genes_rds)) {
+  genes_gr <- readRDS(gtf_genes_rds)
+} else {
+  genes_gr <- rtracklayer::import(gencode_gtf_gz, feature.type = "gene")
+  saveRDS(genes_gr, gtf_genes_rds)
+}
+
+genes_tbl <- as_tibble(as.data.frame(genes_gr)) %>%
+  transmute(
+    gene_chrom = seqnames,
+    gene_start = start,
+    gene_end = end,
+    strand = strand,
+    gene_id = gene_id,
+    gene_name = gene_name,
+    gene_type = gene_type,
+    tss = if_else(strand == "-", gene_end, gene_start)
+  )
+
+peak_gr <- GRanges(seqnames = bed$chrom, ranges = IRanges(start = bed$start + 1, end = bed$end))
+names(peak_gr) <- bed$peak_id
+gene_gr <- GRanges(seqnames = genes_tbl$gene_chrom, ranges = IRanges(genes_tbl$gene_start, genes_tbl$gene_end), strand = genes_tbl$strand)
+names(gene_gr) <- genes_tbl$gene_name
+
+nearest_idx <- nearest(peak_gr, gene_gr, ignore.strand = TRUE)
+nearest_genes <- genes_tbl[nearest_idx, ]
+peak_mid <- start(peak_gr) + floor((width(peak_gr) - 1) / 2)
+distance_to_tss <- abs(peak_mid - nearest_genes$tss)
+
+promoter_gr <- promoters(gene_gr, upstream = 2000, downstream = 500)
+promoter_hits <- countOverlaps(peak_gr, promoter_gr, ignore.strand = TRUE) > 0
+gene_body_hits <- countOverlaps(peak_gr, gene_gr, ignore.strand = TRUE) > 0
+
+annotation_tbl <- bed %>%
+  mutate(
+    nearest_gene = nearest_genes$gene_name,
+    nearest_gene_id = nearest_genes$gene_id,
+    nearest_gene_type = nearest_genes$gene_type,
+    distance_to_tss = distance_to_tss,
+    regulatory_class = case_when(
+      promoter_hits ~ "promoter_proximal",
+      gene_body_hits ~ "gene_body",
+      distance_to_tss <= 50000 ~ "distal_within_50kb",
+      TRUE ~ "distal_gt_50kb"
+    )
+  ) %>%
+  left_join(signature_tbl, by = c("peak_id", "chrom", "start", "end", "width"))
+
+annotation_summary <- annotation_tbl %>%
+  mutate(set = if_else(il10_lps_suppressed, "IL10_suppressed_signature", "Other_peaks")) %>%
+  count(set, regulatory_class) %>%
+  group_by(set) %>%
+  mutate(fraction = n / sum(n)) %>%
+  ungroup()
+annotation_summary
+```
+
+```{r annotation-plots}
+ggplot(annotation_summary, aes(regulatory_class, fraction, fill = set)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Fraction of peaks",
+    fill = NULL,
+    title = "IL-10-suppressed peaks include promoter and distal regulatory contexts"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+genes_of_interest <- c("IFIT1", "IFIT2", "IFIT3", "ISG15", "CXCL10", "IRF1", "IRF5", "TNF", "IL6", "IL1B")
+annotation_tbl %>%
+  filter(il10_lps_suppressed, nearest_gene %in% genes_of_interest) %>%
+  arrange(distance_to_tss) %>%
+  select(peak_id, regulatory_class, nearest_gene, distance_to_tss, lps_logFC, il10_lps_logFC, il10_tnf_logFC) %>%
+  head(25)
+```
+
+Nearest-gene annotation is useful but not sufficient. A promoter-proximal peak
+near an interferon-stimulated gene is more interpretable than a distal peak that
+happens to be nearest to a large gene desert neighbor; conversely, a distal
+enhancer may regulate a gene that is not the nearest TSS. Because this bundle
+does not include chromatin loops, enhancer-promoter maps, RNA-seq per donor, or
+IRF1 CUT&RUN tracks, I treat the annotation as a prioritization layer rather
+than proof of target-gene regulation.
+
+The paper's broader mechanism helps calibrate the interpretation. IL-10 does not
+need to erase all inflammatory chromatin to suppress inflammatory gene
+expression. Peaks near ISG and IRF-linked loci are particularly relevant because
+the full study tied IL-10 suppression to IRF1/IRF5 and the IFN-beta amplification
+loop, while many NF-kB/AP-1-accessible loci were more preserved.
+
+In this dataset, the IL-10-suppressed signature is not purely promoter-proximal:
+`r scales::percent(annotation_summary$fraction[annotation_summary$set == "IL10_suppressed_signature" & annotation_summary$regulatory_class == "gene_body"], accuracy = 0.1)`
+falls in gene bodies and `r scales::percent(sum(annotation_summary$fraction[annotation_summary$set == "IL10_suppressed_signature" & annotation_summary$regulatory_class %in% c("distal_within_50kb", "distal_gt_50kb")]), accuracy = 0.1)`
+is distal by this simple annotation. That pattern fits enhancer-rich immune
+regulation and makes proximity-based interpretation useful but incomplete. The
+right biological readout is therefore not "nearest gene equals target gene"; it
+is whether the annotated regulatory neighborhoods are coherent with the
+IRF/interferon biology tested in the motif and pathway sections.
+
+## MCQ 5: peak-to-gene annotation
+
+The IL-10-suppressed peaks include promoter-proximal, gene-body and distal
+regulatory contexts, with examples near interferon-stimulated and inflammatory
+genes. Which annotation strategy best supports downstream biological
+interpretation?
+
+A. Treat nearest-gene labels as regulatory hypotheses and interpret them with
+promoter overlap, gene-body overlap, distance to TSS, gene biotype and pathway
+coherence, especially for distal immune enhancers.
+
+B. Restrict the analysis to promoter-proximal peaks only, because distal ATAC
+peaks cannot contribute to interferon or inflammatory gene regulation.
+
+C. Use the nearest protein-coding gene as the confirmed target for every
+suppressed peak, then interpret pathway enrichment as direct gene repression.
+
+D. Prioritize the genes with the smallest TSS distance even if the motif and
+pathway results point to a different regulatory program.
+
+**Answer: A.** The annotation pattern supports enhancer-rich immune regulation.
+Nearest-gene labels are valuable for enrichment and hypothesis generation, but
+the biological claim becomes stronger only when proximity agrees with regulatory
+class, motif grammar and pathway coherence.
+
+# TF motif enrichment
+
+```{r motif-background}
+mean_lps_accessibility <- rowMeans(counts[, sample_info$condition == "LPS", drop = FALSE])
+motif_tbl <- annotation_tbl %>%
+  mutate(mean_lps_accessibility = mean_lps_accessibility[peak_id])
+
+foreground_ids <- motif_tbl %>%
+  filter(il10_lps_suppressed) %>%
+  arrange(il10_lps_fdr, il10_lps_logFC) %>%
+  pull(peak_id)
+
+candidate_bg <- motif_tbl %>%
+  filter(
+    lps_induced,
+    !il10_lps_broad_suppressed,
+    !peak_id %in% foreground_ids
+  ) %>%
+  mutate(
+    width_bin = ntile(width, 10),
+    access_bin = ntile(mean_lps_accessibility, 10)
+  )
+
+fg_bins <- motif_tbl %>%
+  filter(peak_id %in% foreground_ids) %>%
+  mutate(width_bin = ntile(width, 10), access_bin = ntile(mean_lps_accessibility, 10)) %>%
+  count(width_bin, access_bin, name = "fg_n")
+
+background_ids <- candidate_bg %>%
+  inner_join(fg_bins, by = c("width_bin", "access_bin")) %>%
+  group_by(width_bin, access_bin) %>%
+  mutate(random_order = runif(n())) %>%
+  arrange(random_order, .by_group = TRUE) %>%
+  filter(row_number() <= 2 * first(fg_n)) %>%
+  ungroup() %>%
+  pull(peak_id)
+
+motif_sets <- tibble(
+  set = c("foreground", "background"),
+  n = c(length(foreground_ids), length(background_ids))
+)
+motif_sets
+```
+
+```{r motif-scan}
+motif_cache <- file.path(ref_dir, "jaspar2024_il10_signature_motif_results.rds")
+if (file.exists(motif_cache)) {
+  motif_enrichment <- readRDS(motif_cache)
+} else {
+  all_motif_ids <- c(foreground_ids, background_ids)
+  all_gr <- peak_gr[all_motif_ids]
+  pwms <- TFBSTools::getMatrixSet(
+    JASPAR2024::db(JASPAR2024::JASPAR2024()),
+    opts = list(collection = "CORE", tax_group = "vertebrates", all_versions = FALSE)
+  )
+  motif_ix <- motifmatchr::matchMotifs(
+    pwms,
+    all_gr,
+    genome = BSgenome.Hsapiens.UCSC.hg38,
+    out = "matches",
+    p.cutoff = 5e-5
+  )
+  motif_mat <- as.matrix(motifmatchr::motifMatches(motif_ix))
+  is_fg <- rownames(motif_mat) %in% foreground_ids
+  motif_enrichment <- map_dfr(seq_along(pwms), function(i) {
+    present_fg <- sum(motif_mat[is_fg, i])
+    absent_fg <- sum(!motif_mat[is_fg, i])
+    present_bg <- sum(motif_mat[!is_fg, i])
+    absent_bg <- sum(!motif_mat[!is_fg, i])
+    ft <- fisher.test(matrix(c(present_fg, absent_fg, present_bg, absent_bg), nrow = 2, byrow = TRUE))
+    tibble(
+      motif_id = TFBSTools::ID(pwms[[i]]),
+      motif_name = TFBSTools::name(pwms[[i]]),
+      foreground_with_motif = present_fg,
+      background_with_motif = present_bg,
+      foreground_fraction = present_fg / (present_fg + absent_fg),
+      background_fraction = present_bg / (present_bg + absent_bg),
+      odds_ratio = unname(ft$estimate),
+      p_value = ft$p.value
+    )
+  }) %>%
+    mutate(fdr = p.adjust(p_value, method = "BH")) %>%
+    arrange(fdr, desc(odds_ratio))
+  saveRDS(motif_enrichment, motif_cache)
+}
+
+motif_enrichment %>%
+  filter(odds_ratio > 1) %>%
+  slice_head(n = 20)
+```
+
+```{r motif-plot}
+top_motifs <- motif_enrichment %>%
+  filter(odds_ratio > 1, is.finite(odds_ratio)) %>%
+  slice_head(n = 15) %>%
+  mutate(motif_label = paste0(motif_name, " (", motif_id, ")"))
+
+ggplot(top_motifs, aes(reorder(motif_label, odds_ratio), odds_ratio, fill = -log10(fdr))) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Motif odds ratio",
+    fill = "-log10 FDR",
+    title = "Motifs enriched in IL-10-suppressed LPS-induced peaks"
+  ) +
+  theme_bw()
+```
+
+The motif analysis tests the regulatory grammar of the IL-10-sensitive peak set.
+The foreground is the strong LPS-induced, IL-10-suppressed signature
+(`r length(foreground_ids)` peaks). The background is not all merged peaks; it is
+LPS-induced accessible chromatin that is not broadly IL-10-suppressed, sampled
+with width and LPS-accessibility matching (`r length(background_ids)` peaks).
+That background asks the sharper question for an R&D audience: among
+inflammatory regulatory elements that open with LPS, what distinguishes the
+subset that IL-10 can close?
+
+The strongest enrichments are IRF/ISRE-family and STAT1/STAT2-like motifs.
+For example, `r motif_enrichment$motif_name[1]` is present in
+`r scales::percent(motif_enrichment$foreground_fraction[1], accuracy = 0.1)` of
+foreground peaks versus
+`r scales::percent(motif_enrichment$background_fraction[1], accuracy = 0.1)` of
+matched background peaks, with an odds ratio of
+`r round(motif_enrichment$odds_ratio[1], 2)` after BH correction across tested
+motifs. This aligns strongly with Mishra et al.: IL-10 does not simply remove
+all inflammatory enhancer grammar; it preferentially marks the IRF/interferon
+arm of the response as suppressible.
+
+The careful limitation is TF identity. A JASPAR IRF motif does not prove IRF1
+binding, IRF5 binding, or displacement of a specific IRF at that site. The paper
+could make that stronger claim because it added CUT&RUN, footprinting and
+perturbation. From this ATAC matrix, the defensible conclusion is that the
+IL-10-sensitive chromatin compartment is enriched for IRF/ISRE-compatible
+sequence grammar, not that a single TF has been causally assigned.
+
+## MCQ 6: TF motif enrichment
+
+The motif foreground is the LPS-induced IL-10-suppressed signature, and the
+matched background is LPS-induced chromatin that remains accessible with IL-10.
+The top enriched motifs are IRF/ISRE-family and STAT1/STAT2-like motifs. Which
+interpretation best fits these results?
+
+A. IL-10-sensitive peaks are distinguished from other LPS-induced accessible
+regions by IRF/interferon-compatible sequence grammar, supporting the paper's
+model that IL-10 preferentially suppresses the IRF/IFN regulatory arm rather
+than uniformly erasing inflammatory accessibility.
+
+B. IRF motif enrichment proves that IRF1 is directly bound at every foreground
+peak and that IRF5 is not involved.
+
+C. Because the foreground and background are both LPS-induced, any IRF
+enrichment must be a technical artifact of peak width rather than biology.
+
+D. The absence of a uniquely dominant NF-kB motif means LPS did not activate
+canonical inflammatory chromatin in this dataset.
+
+**Answer: A.** The matched background makes the result more specific: this is
+not merely "inflammatory peaks contain motifs," but that the IL-10-sensitive
+fraction of the LPS response is especially IRF/ISRE-like. The result supports
+the paper's regulatory model without overclaiming exact TF occupancy from motif
+sequence alone.
+
+# Pathway enrichment and regulatory interpretation
+
+```{r hallmark-parse}
+parse_gmt <- function(path) {
+  lines <- readLines(path)
+  pieces <- strsplit(lines, "\t")
+  tibble(
+    pathway = vapply(pieces, `[[`, character(1), 1),
+    genes = lapply(pieces, function(x) x[-c(1, 2)])
+  )
+}
+
+hallmark <- parse_gmt(hallmark_gmt)
+signature_genes <- annotation_tbl %>%
+  filter(il10_lps_suppressed, nearest_gene_type == "protein_coding") %>%
+  pull(nearest_gene) %>%
+  unique()
+
+background_genes <- annotation_tbl %>%
+  filter(lps_induced, nearest_gene_type == "protein_coding") %>%
+  pull(nearest_gene) %>%
+  unique()
+
+enrich_hyper <- function(path_genes, query, universe) {
+  path_genes <- intersect(path_genes, universe)
+  query <- intersect(query, universe)
+  a <- length(intersect(path_genes, query))
+  b <- length(query) - a
+  c <- length(path_genes) - a
+  d <- length(universe) - a - b - c
+  if (a == 0 || length(path_genes) < 5) {
+    return(tibble(overlap = a, pathway_size = length(path_genes), p_value = 1, odds_ratio = NA_real_))
+  }
+  ft <- fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), alternative = "greater")
+  tibble(overlap = a, pathway_size = length(path_genes), p_value = ft$p.value, odds_ratio = unname(ft$estimate))
+}
+
+hallmark_enrichment <- hallmark %>%
+  mutate(stats = map(genes, enrich_hyper, query = signature_genes, universe = background_genes)) %>%
+  select(pathway, stats) %>%
+  unnest(stats) %>%
+  mutate(fdr = p.adjust(p_value, method = "BH")) %>%
+  arrange(fdr, desc(odds_ratio))
+
+hallmark_enrichment %>% slice_head(n = 20)
+```
+
+```{r hallmark-plot}
+top_pathways <- hallmark_enrichment %>%
+  filter(overlap > 0, is.finite(odds_ratio)) %>%
+  slice_head(n = 12) %>%
+  mutate(pathway = gsub("^HALLMARK_", "", pathway))
+
+ggplot(top_pathways, aes(reorder(pathway, odds_ratio), odds_ratio, fill = -log10(fdr))) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Odds ratio",
+    fill = "-log10 FDR",
+    title = "Hallmark enrichment among genes near IL-10-suppressed peaks"
+  ) +
+  theme_bw()
+```
+
+The pathway result closes the loop between chromatin statistics and monocyte
+biology. Genes near IL-10-suppressed peaks are most strongly enriched for
+Hallmark interferon gamma response and interferon alpha response
+(FDR `r signif(hallmark_enrichment$fdr[hallmark_enrichment$pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE"], 3)`
+and `r signif(hallmark_enrichment$fdr[hallmark_enrichment$pathway == "HALLMARK_INTERFERON_ALPHA_RESPONSE"], 3)`,
+respectively). TNF/NF-kB signaling is present but weaker
+(FDR `r signif(hallmark_enrichment$fdr[hallmark_enrichment$pathway == "HALLMARK_TNFA_SIGNALING_VIA_NFKB"], 3)`).
+That ranking matters: it mirrors the paper's central observation that IL-10 more
+strongly suppresses IFN/ISG biology while inflammatory NF-kB programs are
+modulated but not simply eliminated.
+
+The integrated model is therefore selective rather than global. IL-10
+preferentially suppresses LPS-induced accessible elements with IRF/ISRE-like
+motif grammar, and those elements annotate near genes in interferon and
+inflammatory response pathways. In the full Mishra et al. study, that chromatin
+pattern is connected to suppression of IRF1/IRF5 and the IFN-beta amplification
+loop. In this take-home matrix, I can recapitulate the regulatory footprint of
+that model, but I cannot independently prove TF occupancy, H3K27ac loss, IFNB
+production, or enhancer-promoter looping.
+
+A practical follow-up would be to layer RNA-seq or perturbation data onto this
+signature: prioritize suppressed ATAC peaks near ISG loci, test whether linked
+genes lose expression with IL-10, and use IRF1/IRF5 or STAT1/STAT2 occupancy data
+to separate motif-family inference from TF-specific mechanism. That is the
+decision point where this report moves from regulatory interpretation to causal
+model testing.
+
+## MCQ 7: pathway and regulatory interpretation
+
+The IL-10-suppressed ATAC signature is enriched for IRF/ISRE-like motifs and
+maps near genes enriched most strongly for interferon alpha/gamma response, with
+weaker but present TNF/NF-kB pathway signal. Which final model best integrates
+these findings with Mishra et al.?
+
+A. IL-10 globally closes monocyte chromatin; interferon pathways appear enriched
+only because ISG loci are generally more accessible than inflammatory loci.
+
+B. IL-10 preferentially suppresses an IRF/interferon-linked component of the
+LPS-induced chromatin response, with secondary inflammatory pathway involvement;
+this is consistent with the paper's IRF1/IRF5 and IFN-beta amplification-loop
+model, while remaining short of proving TF occupancy from ATAC alone.
+
+C. IL-10 blocks canonical NF-kB activation genome-wide, and the interferon motif
+signal is downstream of complete NF-kB shutdown.
+
+D. The pathway result should be ignored because nearest-gene annotation is
+imperfect; motif enrichment alone is sufficient to define the mechanism.
+
+**Answer: B.** The chromatin, motif and pathway layers converge on selective
+IRF/interferon suppression with inflammatory pathway involvement. The strongest
+claim from this report is mechanistic alignment with Mishra et al.; causal TF
+assignment still requires the orthogonal data types used in the paper.
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
